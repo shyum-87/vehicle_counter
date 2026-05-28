@@ -70,6 +70,7 @@ database and API.
 """
 
 import argparse
+import csv
 import datetime
 import json
 import logging
@@ -200,6 +201,16 @@ class VehicleCounter:
         }
         # Per-object tracking: origin zone, whether counted, vehicle type
         self.object_info: Dict[int, Dict[str, object]] = {}
+
+        # CSV logging
+        self.csv_path = os.path.splitext(zones_path)[0] + "_counts.csv"
+        self._csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "timestamp", "direction", "vehicle_type",
+            "car_count", "bus_count", "truck_count", "total_count",
+        ])
+        self.logger.info("CSV log: %s", self.csv_path)
 
     def save_to_db(self, timestamp: datetime.datetime, lane: str, direction: str, vehicle_type: str) -> None:
         """Persist a count event to the configured database.
@@ -384,6 +395,19 @@ class VehicleCounter:
                         "Count: direction=%s type=%s origin=%s id=%s",
                         direction, vtype, origin, track_id,
                     )
+
+                    # Write CSV row
+                    self._csv_writer.writerow([
+                        timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                        direction,
+                        vtype,
+                        self.counts["by_type"]["car"],
+                        self.counts["by_type"]["bus"],
+                        self.counts["by_type"]["truck"],
+                        self.counts["total"],
+                    ])
+                    self._csv_file.flush()
+
                     self.save_to_db(timestamp, direction, direction, vtype)
                     self.send_to_api({
                         "timestamp": timestamp.isoformat(),
@@ -467,6 +491,10 @@ class VehicleCounter:
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
+        # Cleanup
+        self._csv_file.close()
+        self.logger.info("CSV log saved: %s (%d records)", self.csv_path, self.counts["total"])
 
         if is_screen:
             sct, _ = capture
