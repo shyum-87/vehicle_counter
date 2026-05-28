@@ -40,7 +40,29 @@ pip install --no-index --find-links=wheels -r requirements.txt
 
 ### 1. 존(Zone) 설정
 
-차량 카운팅에 사용할 감지 영역을 설정합니다. (추후 `zone_config.py` 제공 예정)
+차량 카운팅에 사용할 감지 영역을 설정합니다.
+
+```bash
+# 저장된 이미지 사용
+python zone_config.py --source road_image.jpg
+
+# 화면 캡처 사용
+python zone_config.py --source screen --screen-top 200 --screen-left 100 --screen-width 800 --screen-height 600
+```
+
+3개의 존을 순서대로 그립니다:
+1. **3시 도로 (Entry)** — 차량 진입 감지 영역
+2. **11시 도로 (Origin)** — 좌회전 출발지
+3. **7시 도로 (Origin)** — 우회전 출발지
+
+조작법:
+- **마우스 좌클릭**: 다각형 꼭짓점 추가
+- **R**: 현재 존 초기화
+- **Enter**: 현재 존 확정
+- **S**: 저장 (3개 존 완료 후)
+- **Q**: 취소
+
+결과는 `zones.json`에 저장됩니다.
 
 ### 2. 차량 카운팅 실행
 
