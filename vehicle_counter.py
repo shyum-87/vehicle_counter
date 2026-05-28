@@ -72,19 +72,18 @@ database and API.
 import argparse
 import datetime
 import logging
+import os
 import sys
 from typing import Dict, Optional
 
 
 try:
-    # Import optional dependencies.  These imports will fail in
-    # environments where the packages are not installed.  Catch the
-    # exceptions early so the user gets a clear error message.
     from ultralytics import YOLO  # type: ignore
     import supervision as sv  # type: ignore
     import cv2  # type: ignore
     import numpy as np  # type: ignore
     import requests  # type: ignore
+    import mss  # type: ignore
     from sqlalchemy import create_engine  # type: ignore
     from sqlalchemy.exc import SQLAlchemyError  # type: ignore
 except ImportError as e:  # pragma: no cover
@@ -94,9 +93,6 @@ except ImportError as e:  # pragma: no cover
         "dependencies listed in the module documentation before running this script.",
         file=sys.stderr,
     )
-    # Re‑raise to inform the user.  In production, you might choose to
-    # install packages programmatically or handle missing imports more
-    # gracefully.
     raise
 
 
@@ -118,40 +114,15 @@ class VehicleCounter:
         lane_divider_ratio: float = 0.5,
         db_url: Optional[str] = None,
         api_url: Optional[str] = None,
+        screen_region: Optional[Dict[str, int]] = None,
     ) -> None:
-        """
-        Initialise the vehicle counter.
-
-        Parameters
-        ----------
-        source : str
-            Path or RTSP URL of the video source.
-        weights : str
-            Path to the YOLO model weights.  You can download pretrained
-            weights from Ultralytics (e.g. yolov8n.pt, yolov8s.pt,
-            yolov11n.pt, etc.).
-        y_line_ratio : float, optional
-            Vertical position of the counting line expressed as a fraction
-            of frame height (0 = top, 1 = bottom).  Defaults to 0.5.
-        lane_divider_ratio : float, optional
-            Horizontal position of the lane divider expressed as a
-            fraction of frame width (0 = left, 1 = right).  Defaults
-            to 0.5.
-        db_url : str, optional
-            SQLAlchemy database URL for persisting count records.  If
-            provided, the script will attempt to insert a row for each
-            counted vehicle.
-        api_url : str, optional
-            Endpoint URL for sending count events as JSON via HTTP
-            POST.  If provided, the script will send each count event
-            to this endpoint.
-        """
         self.source = source
         self.weights = weights
         self.y_line_ratio = y_line_ratio
         self.lane_divider_ratio = lane_divider_ratio
         self.db_url = db_url
         self.api_url = api_url
+        self.screen_region = screen_region
 
         # Set up logging
         logging.basicConfig(
@@ -161,9 +132,24 @@ class VehicleCounter:
         )
         self.logger = logging.getLogger(self.__class__.__name__)
 
+        # Validate weights file exists locally (for air-gapped environments)
+        if not os.path.isfile(weights):
+            self.logger.error(
+                "YOLO weights file not found: %s. "
+                "In air-gapped environments, download the weights file in advance "
+                "and provide the local path via --weights.",
+                weights,
+            )
+            raise FileNotFoundError(f"Weights file not found: {weights}")
+
         # Load YOLO model
         self.logger.info("Loading YOLO model from %s", weights)
         self.model = YOLO(weights)
+
+        # Select device: GPU if available, otherwise CPU
+        import torch
+        self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.logger.info("Using device: %s", self.device)
 
         # Initialise tracker
         self.tracker = sv.ByteTrack()
@@ -232,30 +218,57 @@ class VehicleCounter:
         except requests.RequestException as e:
             self.logger.error("Failed to send API request: %s", e)
 
-    def run(self) -> None:
-        """Start the counting loop.
+    def _open_source(self):
+        """Open video source or screen capture. Returns (capture, is_screen) tuple."""
+        if self.source == "screen":
+            sct = mss.mss()
+            if self.screen_region:
+                monitor = self.screen_region
+            else:
+                monitor = sct.monitors[1]  # Primary monitor
+            self.logger.info(
+                "Screen capture: top=%d, left=%d, width=%d, height=%d",
+                monitor["top"], monitor["left"], monitor["width"], monitor["height"],
+            )
+            return (sct, monitor), True
 
-        Opens the video source, processes each frame to detect and track
-        vehicles, updates counts when vehicles cross the counting line,
-        and optionally displays annotated frames.
-        """
-        # Open video capture
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened():
             self.logger.error("Failed to open video source: %s", self.source)
-            return
+            return None, False
         self.logger.info("Processing video stream: %s", self.source)
+        return cap, False
 
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if frame_width == 0 or frame_height == 0:
-            # Some streams return 0 for width/height before reading a frame.
-            # We'll update these values after the first successful read.
-            frame_width, frame_height = None, None
+    def _read_frame(self, capture, is_screen):
+        """Read a single frame from video or screen capture."""
+        if is_screen:
+            sct, monitor = capture
+            screenshot = sct.grab(monitor)
+            # mss returns BGRA, convert to BGR for OpenCV
+            frame = np.array(screenshot)[:, :, :3].copy()
+            return True, frame
+        else:
+            return capture.read()
+
+    def run(self) -> None:
+        """Start the counting loop."""
+        capture, is_screen = self._open_source()
+        if capture is None:
+            return
+
+        if is_screen:
+            _, monitor = capture
+            frame_width = monitor["width"]
+            frame_height = monitor["height"]
+        else:
+            frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if frame_width == 0 or frame_height == 0:
+                frame_width, frame_height = None, None
 
         # Main processing loop
         while True:
-            ret, frame = cap.read()
+            ret, frame = self._read_frame(capture, is_screen)
             if not ret:
                 break
 
@@ -268,7 +281,7 @@ class VehicleCounter:
 
             # Run YOLO detection.  The Ultralytics API returns a list
             # of results, one per image; we take the first result.
-            results = self.model.predict(frame, device=0)
+            results = self.model.predict(frame, device=self.device, verbose=False)
             result = results[0]
 
             # Convert to Supervision Detections
@@ -276,9 +289,7 @@ class VehicleCounter:
 
             # Filter detections by vehicle classes of interest
             mask = np.isin(detections.class_id, list(self.VEHICLE_CLASSES.keys()))
-            detections.xyxy = detections.xyxy[mask]
-            detections.class_id = detections.class_id[mask]
-            detections.confidence = detections.confidence[mask]
+            detections = detections[mask]
 
             # Update tracker with filtered detections
             tracked = self.tracker.update_with_detections(detections)
@@ -419,46 +430,72 @@ class VehicleCounter:
             )
 
             # Display the frame in a window.  Press 'q' to quit.
-            cv2.imshow("Vehicle Counter", frame)
+            # Resize for display to avoid overwhelming the screen
+            display_h = 720
+            scale = display_h / frame.shape[0]
+            display_w = int(frame.shape[1] * scale)
+            display_frame = cv2.resize(frame, (display_w, display_h))
+            cv2.imshow("Vehicle Counter", display_frame)
+
+            # On first frame, position the result window
+            if not hasattr(self, "_window_moved"):
+                if is_screen:
+                    # Place window at top-left so it's always visible
+                    cv2.moveWindow("Vehicle Counter", 0, 0)
+                self._window_moved = True
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        cap.release()
+        if is_screen:
+            sct, _ = capture
+            sct.close()
+        else:
+            capture.release()
         cv2.destroyAllWindows()
 
 
 def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Vehicle counting with YOLO and ByteTrack")
-    parser.add_argument("--source", type=str, required=True, help="Video source (file path or RTSP URL)")
     parser.add_argument(
-        "--weights",
-        type=str,
-        default="yolov8s.pt",
+        "--source", type=str, required=True,
+        help="Video source: file path, RTSP URL, or 'screen' for screen capture",
+    )
+    parser.add_argument(
+        "--weights", type=str, default="yolov8s.pt",
         help="Path to YOLO weights file (e.g. yolov8n.pt)",
     )
     parser.add_argument(
-        "--y-line-ratio",
-        type=float,
-        default=0.5,
+        "--y-line-ratio", type=float, default=0.5,
         help="Vertical position of counting line as fraction of frame height (0-1)",
     )
     parser.add_argument(
-        "--lane-divider-ratio",
-        type=float,
-        default=0.5,
+        "--lane-divider-ratio", type=float, default=0.5,
         help="Horizontal position of lane divider as fraction of frame width (0-1)",
     )
     parser.add_argument(
-        "--db-url",
-        type=str,
-        default=None,
+        "--screen-top", type=int, default=None,
+        help="Screen capture region: top pixel coordinate",
+    )
+    parser.add_argument(
+        "--screen-left", type=int, default=None,
+        help="Screen capture region: left pixel coordinate",
+    )
+    parser.add_argument(
+        "--screen-width", type=int, default=None,
+        help="Screen capture region: width in pixels",
+    )
+    parser.add_argument(
+        "--screen-height", type=int, default=None,
+        help="Screen capture region: height in pixels",
+    )
+    parser.add_argument(
+        "--db-url", type=str, default=None,
         help="SQLAlchemy database URL (optional)",
     )
     parser.add_argument(
-        "--api-url",
-        type=str,
-        default=None,
+        "--api-url", type=str, default=None,
         help="Endpoint URL to send count events as JSON (optional)",
     )
     return parser.parse_args(args)
@@ -467,6 +504,19 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
 def main() -> None:
     """Entry point for command line execution."""
     args = parse_args()
+
+    # Build screen region dict if any screen coordinate is specified
+    screen_region = None
+    if args.source == "screen" and all(
+        v is not None for v in [args.screen_top, args.screen_left, args.screen_width, args.screen_height]
+    ):
+        screen_region = {
+            "top": args.screen_top,
+            "left": args.screen_left,
+            "width": args.screen_width,
+            "height": args.screen_height,
+        }
+
     counter = VehicleCounter(
         source=args.source,
         weights=args.weights,
@@ -474,6 +524,7 @@ def main() -> None:
         lane_divider_ratio=args.lane_divider_ratio,
         db_url=args.db_url,
         api_url=args.api_url,
+        screen_region=screen_region,
     )
     counter.run()
 
