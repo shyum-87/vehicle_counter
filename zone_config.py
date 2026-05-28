@@ -185,7 +185,28 @@ def load_frame(args) -> Optional[np.ndarray]:
                 monitor = {"top": args.screen_top, "left": args.screen_left,
                            "width": args.screen_width, "height": args.screen_height}
             else:
-                monitor = sct.monitors[1]
+                # Let user drag-select a region
+                full_monitor = sct.monitors[1]
+                screenshot = sct.grab(full_monitor)
+                full_frame = np.array(screenshot)[:, :, :3].copy()
+                max_h = 900
+                scale = max_h / full_frame.shape[0]
+                sel_w = int(full_frame.shape[1] * scale)
+                sel_frame = cv2.resize(full_frame, (sel_w, max_h))
+                cv2.putText(sel_frame, "Drag to select region, then press ENTER or SPACE",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                roi = cv2.selectROI("Select Region", sel_frame, fromCenter=False, showCrosshair=True)
+                cv2.destroyWindow("Select Region")
+                x, y, w, h = roi
+                if w == 0 or h == 0:
+                    print("No region selected.", file=sys.stderr)
+                    return None
+                monitor = {
+                    "top": full_monitor["top"] + int(y / scale),
+                    "left": full_monitor["left"] + int(x / scale),
+                    "width": int(w / scale),
+                    "height": int(h / scale),
+                }
             screenshot = sct.grab(monitor)
             frame = np.array(screenshot)[:, :, :3].copy()
             return frame

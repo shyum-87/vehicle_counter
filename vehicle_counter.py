@@ -202,6 +202,9 @@ class VehicleCounter:
         # Per-object tracking: origin zone, whether counted, vehicle type
         self.object_info: Dict[int, Dict[str, object]] = {}
 
+        # Hourly counts for bar chart: {hour_str: {"car": n, "bus": n, "truck": n}}
+        self.hourly_counts: Dict[str, Dict[str, int]] = {}
+
         # CSV logging
         self.csv_path = os.path.splitext(zones_path)[0] + "_counts.csv"
         self._csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
@@ -255,6 +258,119 @@ class VehicleCounter:
         except requests.RequestException as e:
             self.logger.error("Failed to send API request: %s", e)
 
+    def _draw_bar_chart(self, frame: np.ndarray) -> None:
+        """Draw hourly stacked bar chart on the bottom-right of the frame."""
+        if not self.hourly_counts:
+            return
+
+        # Chart dimensions
+        chart_w = 380
+        bar_max_h = 140
+        bar_w = 28
+        gap = 6
+        padding = 10
+        hours = sorted(self.hourly_counts.keys())
+        # Show last 8 hours max
+        if len(hours) > 8:
+            hours = hours[-8:]
+
+        num_bars = len(hours)
+        chart_actual_w = num_bars * (bar_w + gap) + padding * 2
+        chart_h = bar_max_h + 50  # space for labels
+        chart_actual_w = max(chart_actual_w, 120)
+
+        # Position: bottom-right
+        x0 = frame.shape[1] - chart_actual_w - 10
+        y0 = frame.shape[0] - chart_h - 10
+
+        # Background
+        cv2.rectangle(frame, (x0, y0), (x0 + chart_actual_w, y0 + chart_h), (0, 0, 0), -1)
+        cv2.rectangle(frame, (x0, y0), (x0 + chart_actual_w, y0 + chart_h), (80, 80, 80), 1)
+
+        # Title
+        cv2.putText(frame, "Hourly Count", (x0 + 5, y0 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # Find max count for scaling
+        max_count = max(
+            sum(self.hourly_counts[h].values()) for h in hours
+        )
+        if max_count == 0:
+            max_count = 1
+
+        type_colors = {"car": (0, 200, 0), "bus": (0, 180, 255), "truck": (255, 100, 100)}
+        bar_base_y = y0 + chart_h - 25  # bottom of bars, leave room for labels
+
+        for i, hour in enumerate(hours):
+            bx = x0 + padding + i * (bar_w + gap)
+            counts = self.hourly_counts[hour]
+            total = sum(counts.values())
+
+            # Draw stacked bars bottom-up
+            cur_y = bar_base_y
+            for vtype in ["truck", "bus", "car"]:
+                cnt = counts.get(vtype, 0)
+                if cnt == 0:
+                    continue
+                seg_h = max(int((cnt / max_count) * bar_max_h), 3)
+                color = type_colors[vtype]
+                cv2.rectangle(frame, (bx, cur_y - seg_h), (bx + bar_w, cur_y), color, -1)
+                # Count label on segment
+                if seg_h >= 12:
+                    cv2.putText(frame, str(cnt), (bx + 2, cur_y - 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                cur_y -= seg_h
+
+            # Total on top of bar
+            total_y = bar_base_y - max(int((total / max_count) * bar_max_h), 3) - 5
+            cv2.putText(frame, str(total), (bx, max(total_y, y0 + 25)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+            # Hour label below bar
+            cv2.putText(frame, hour, (bx - 2, bar_base_y + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 180, 180), 1)
+
+        # Legend
+        legend_y = y0 + chart_h - 8
+        lx = x0 + padding
+        for vtype, color in type_colors.items():
+            cv2.rectangle(frame, (lx, legend_y - 8), (lx + 10, legend_y), color, -1)
+            cv2.putText(frame, vtype, (lx + 13, legend_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 180, 180), 1)
+            lx += 55
+
+    @staticmethod
+    def _select_screen_region(sct) -> Optional[Dict[str, int]]:
+        """Show full screen capture and let user drag-select a region."""
+        full_monitor = sct.monitors[1]
+        screenshot = sct.grab(full_monitor)
+        full_frame = np.array(screenshot)[:, :, :3].copy()
+
+        # Resize for selection UI (full res may be too large)
+        max_h = 900
+        scale = max_h / full_frame.shape[0]
+        sel_w = int(full_frame.shape[1] * scale)
+        sel_frame = cv2.resize(full_frame, (sel_w, max_h))
+
+        cv2.putText(sel_frame, "Drag to select capture region, then press ENTER or SPACE",
+                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        roi = cv2.selectROI("Select Region", sel_frame, fromCenter=False, showCrosshair=True)
+        cv2.destroyWindow("Select Region")
+
+        x, y, w, h = roi
+        if w == 0 or h == 0:
+            return None
+
+        # Scale back to actual screen coordinates
+        monitor = {
+            "top": full_monitor["top"] + int(y / scale),
+            "left": full_monitor["left"] + int(x / scale),
+            "width": int(w / scale),
+            "height": int(h / scale),
+        }
+        return monitor
+
     def _open_source(self):
         """Open video source or screen capture. Returns (capture, is_screen) tuple."""
         if self.source == "screen":
@@ -262,7 +378,13 @@ class VehicleCounter:
             if self.screen_region:
                 monitor = self.screen_region
             else:
-                monitor = sct.monitors[1]  # Primary monitor
+                # Let user drag-select a region
+                self.logger.info("Select capture region by dragging on screen...")
+                monitor = self._select_screen_region(sct)
+                if monitor is None:
+                    self.logger.error("No region selected.")
+                    sct.close()
+                    return None, False
             self.logger.info(
                 "Screen capture: top=%d, left=%d, width=%d, height=%d",
                 monitor["top"], monitor["left"], monitor["width"], monitor["height"],
@@ -391,6 +513,14 @@ class VehicleCounter:
                         self.counts[direction][vtype] += 1
 
                     timestamp = datetime.datetime.now()
+
+                    # Update hourly counts
+                    hour_key = timestamp.strftime("%H:00")
+                    if hour_key not in self.hourly_counts:
+                        self.hourly_counts[hour_key] = {"car": 0, "bus": 0, "truck": 0}
+                    if vtype in self.hourly_counts[hour_key]:
+                        self.hourly_counts[hour_key][vtype] += 1
+
                     self.logger.info(
                         "Count: direction=%s type=%s origin=%s id=%s",
                         direction, vtype, origin, track_id,
@@ -476,6 +606,9 @@ class VehicleCounter:
             y_text += line_h + 5
             cv2.putText(frame, "Press Q to quit",
                         (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+
+            # Draw hourly bar chart
+            self._draw_bar_chart(frame)
 
             # Display resized frame
             display_h = 720
