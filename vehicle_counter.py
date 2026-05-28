@@ -71,10 +71,11 @@ database and API.
 
 import argparse
 import datetime
+import json
 import logging
 import os
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 try:
@@ -96,6 +97,21 @@ except ImportError as e:  # pragma: no cover
     raise
 
 
+def load_zones(path: str) -> Dict:
+    """Load zone configuration from JSON file."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Convert point lists to numpy arrays for cv2.pointPolygonTest
+    for key, zone in data["zones"].items():
+        zone["polygon"] = np.array(zone["points"], dtype=np.int32)
+    return data
+
+
+def point_in_zone(px: float, py: float, polygon: np.ndarray) -> bool:
+    """Check if a point is inside a polygon zone."""
+    return cv2.pointPolygonTest(polygon, (px, py), False) >= 0
+
+
 class VehicleCounter:
     """Real‑time vehicle detection, tracking and counting system."""
 
@@ -110,16 +126,13 @@ class VehicleCounter:
         self,
         source: str,
         weights: str,
-        y_line_ratio: float = 0.5,
-        lane_divider_ratio: float = 0.5,
+        zones_path: str = "zones.json",
         db_url: Optional[str] = None,
         api_url: Optional[str] = None,
         screen_region: Optional[Dict[str, int]] = None,
     ) -> None:
         self.source = source
         self.weights = weights
-        self.y_line_ratio = y_line_ratio
-        self.lane_divider_ratio = lane_divider_ratio
         self.db_url = db_url
         self.api_url = api_url
         self.screen_region = screen_region
@@ -131,6 +144,16 @@ class VehicleCounter:
             handlers=[logging.StreamHandler(sys.stdout)],
         )
         self.logger = logging.getLogger(self.__class__.__name__)
+
+        # Load zone configuration
+        if not os.path.isfile(zones_path):
+            self.logger.error(
+                "Zone config not found: %s. Run zone_config.py first.", zones_path
+            )
+            raise FileNotFoundError(f"Zone config not found: {zones_path}")
+        self.zones_data = load_zones(zones_path)
+        self.zones = self.zones_data["zones"]
+        self.logger.info("Loaded %d zones from %s", len(self.zones), zones_path)
 
         # Validate weights file exists locally (for air-gapped environments)
         if not os.path.isfile(weights):
@@ -159,7 +182,6 @@ class VehicleCounter:
         if self.db_url:
             try:
                 self.db_engine = create_engine(self.db_url)
-                # Test connection by connecting and immediately closing
                 with self.db_engine.connect() as connection:
                     pass
                 self.logger.info("Connected to database: %s", self.db_url)
@@ -167,12 +189,16 @@ class VehicleCounter:
                 self.logger.error("Failed to connect to DB: %s", e)
                 self.db_engine = None
 
-        # Counting state
+        # Zone-based counting state
+        # Counts vehicles entering road_3 by direction and type
         self.counts = {
-            "lane1": {"up": 0, "down": 0},
-            "lane2": {"up": 0, "down": 0},
+            "total": 0,
+            "by_type": {"car": 0, "bus": 0, "truck": 0},
+            "left_turn": {"total": 0, "car": 0, "bus": 0, "truck": 0},   # from road_11
+            "right_turn": {"total": 0, "car": 0, "bus": 0, "truck": 0},  # from road_7
+            "straight": {"total": 0, "car": 0, "bus": 0, "truck": 0},    # other origin
         }
-        # Maintain per object history to avoid double counting
+        # Per-object tracking: origin zone, whether counted, vehicle type
         self.object_info: Dict[int, Dict[str, object]] = {}
 
     def save_to_db(self, timestamp: datetime.datetime, lane: str, direction: str, vehicle_type: str) -> None:
@@ -266,6 +292,18 @@ class VehicleCounter:
             if frame_width == 0 or frame_height == 0:
                 frame_width, frame_height = None, None
 
+        # Scale zones if frame size differs from zone config image size
+        zone_img_w, zone_img_h = self.zones_data["image_size"]
+        self._scaled_zones = {}
+        for key, zone in self.zones.items():
+            if frame_width and frame_height and (zone_img_w != frame_width or zone_img_h != frame_height):
+                scale_x = frame_width / zone_img_w
+                scale_y = frame_height / zone_img_h
+                scaled_pts = (zone["polygon"].astype(np.float64) * [scale_x, scale_y]).astype(np.int32)
+            else:
+                scaled_pts = zone["polygon"]
+            self._scaled_zones[key] = {"type": zone["type"], "polygon": scaled_pts}
+
         # Main processing loop
         while True:
             ret, frame = self._read_frame(capture, is_screen)
@@ -275,172 +313,155 @@ class VehicleCounter:
             if frame_width is None or frame_height is None:
                 frame_height, frame_width = frame.shape[:2]
 
-            # Compute positions of counting line and lane divider
-            y_line = int(frame_height * self.y_line_ratio)
-            lane_divider_x = int(frame_width * self.lane_divider_ratio)
-
-            # Run YOLO detection.  The Ultralytics API returns a list
-            # of results, one per image; we take the first result.
+            # Run YOLO detection
             results = self.model.predict(frame, device=self.device, verbose=False)
             result = results[0]
 
-            # Convert to Supervision Detections
+            # Convert to Supervision Detections and filter vehicle classes
             detections = sv.Detections.from_ultralytics(result)
-
-            # Filter detections by vehicle classes of interest
             mask = np.isin(detections.class_id, list(self.VEHICLE_CLASSES.keys()))
             detections = detections[mask]
 
-            # Update tracker with filtered detections
+            # Update tracker
             tracked = self.tracker.update_with_detections(detections)
 
             # Process each tracked detection
             for bbox, track_id, class_id in zip(
                 tracked.xyxy, tracked.tracker_id, tracked.class_id
             ):
-                # Compute centre of bounding box
                 x1, y1, x2, y2 = bbox
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
-                lane = "lane1" if cx < lane_divider_x else "lane2"
                 vehicle_type = self.VEHICLE_CLASSES.get(int(class_id), "unknown")
 
-                # Initialise object history if new
+                # Initialise object info if new
                 info = self.object_info.setdefault(
                     int(track_id),
                     {
-                        "positions": [],
-                        "counted_up": False,
-                        "counted_down": False,
-                        "lane": lane,
+                        "origin_zone": None,
+                        "counted": False,
                         "vehicle_type": vehicle_type,
                     },
                 )
-                # Update lane and vehicle_type in case class changes
-                info["lane"] = lane
                 info["vehicle_type"] = vehicle_type
 
-                # Append current y position
-                info["positions"].append(cy)
-                # Keep only last few positions to limit memory usage
-                if len(info["positions"]) > 5:
-                    info["positions"] = info["positions"][-5:]
+                # Determine which zone the vehicle is currently in
+                current_zone = None
+                for zone_key, zone_data in self._scaled_zones.items():
+                    if point_in_zone(cx, cy, zone_data["polygon"]):
+                        current_zone = zone_key
+                        break
 
-                # Determine if the object has crossed the counting line
-                # Check if we have at least two positions to compare
-                if len(info["positions"]) >= 2:
-                    prev_y = info["positions"][-2]
-                    curr_y = info["positions"][-1]
-                    # Crossing from above to below: count as down (exit)
-                    if (
-                        prev_y < y_line <= curr_y
-                        and not info["counted_down"]
-                    ):
-                        self.counts[lane]["down"] += 1
-                        info["counted_down"] = True
-                        timestamp = datetime.datetime.now()
-                        self.logger.info(
-                            "Exit: lane=%s type=%s id=%s", lane, vehicle_type, track_id
-                        )
-                        self.save_to_db(timestamp, lane, "down", vehicle_type)
-                        self.send_to_api(
-                            {
-                                "timestamp": timestamp.isoformat(),
-                                "lane": lane,
-                                "direction": "down",
-                                "vehicle_type": vehicle_type,
-                                "track_id": int(track_id),
-                            }
-                        )
-                    # Crossing from below to above: count as up (enter)
-                    elif (
-                        prev_y > y_line >= curr_y
-                        and not info["counted_up"]
-                    ):
-                        self.counts[lane]["up"] += 1
-                        info["counted_up"] = True
-                        timestamp = datetime.datetime.now()
-                        self.logger.info(
-                            "Enter: lane=%s type=%s id=%s", lane, vehicle_type, track_id
-                        )
-                        self.save_to_db(timestamp, lane, "up", vehicle_type)
-                        self.send_to_api(
-                            {
-                                "timestamp": timestamp.isoformat(),
-                                "lane": lane,
-                                "direction": "up",
-                                "vehicle_type": vehicle_type,
-                                "track_id": int(track_id),
-                            }
-                        )
+                # Record origin zone (first zone the vehicle appears in)
+                if current_zone and info["origin_zone"] is None and current_zone != "road_3":
+                    info["origin_zone"] = current_zone
 
-            # Optional: annotate frame for display
-            # Draw counting line
-            cv2.line(
-                frame,
-                (0, y_line),
-                (frame_width, y_line),
-                (0, 255, 255),
-                2,
-            )
-            # Draw lane divider
-            cv2.line(
-                frame,
-                (lane_divider_x, 0),
-                (lane_divider_x, frame_height),
-                (255, 0, 255),
-                2,
-            )
+                # Count when vehicle enters road_3 entry zone
+                if current_zone == "road_3" and not info["counted"]:
+                    info["counted"] = True
+                    origin = info["origin_zone"]
+                    vtype = info["vehicle_type"]
+
+                    # Total count
+                    self.counts["total"] += 1
+                    if vtype in self.counts["by_type"]:
+                        self.counts["by_type"][vtype] += 1
+
+                    # Direction-based count
+                    if origin == "road_11":
+                        direction = "left_turn"
+                    elif origin == "road_7":
+                        direction = "right_turn"
+                    else:
+                        direction = "straight"
+
+                    self.counts[direction]["total"] += 1
+                    if vtype in self.counts[direction]:
+                        self.counts[direction][vtype] += 1
+
+                    timestamp = datetime.datetime.now()
+                    self.logger.info(
+                        "Count: direction=%s type=%s origin=%s id=%s",
+                        direction, vtype, origin, track_id,
+                    )
+                    self.save_to_db(timestamp, direction, direction, vtype)
+                    self.send_to_api({
+                        "timestamp": timestamp.isoformat(),
+                        "direction": direction,
+                        "vehicle_type": vtype,
+                        "origin_zone": origin,
+                        "track_id": int(track_id),
+                    })
+
+            # --- Draw overlay ---
+            overlay = frame.copy()
+
+            # Draw zone polygons
+            zone_colors = {"entry": (0, 200, 0), "origin": (200, 120, 0)}
+            for zone_key, zone_data in self._scaled_zones.items():
+                color = zone_colors.get(zone_data["type"], (128, 128, 128))
+                cv2.fillPoly(overlay, [zone_data["polygon"]], color)
+                # Zone label at centroid
+                cx_z = int(np.mean(zone_data["polygon"][:, 0]))
+                cy_z = int(np.mean(zone_data["polygon"][:, 1]))
+                cv2.putText(frame, zone_key, (cx_z - 30, cy_z),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
             # Draw bounding boxes and IDs
             for bbox, track_id, class_id in zip(
                 tracked.xyxy, tracked.tracker_id, tracked.class_id
             ):
                 x1, y1, x2, y2 = map(int, bbox)
                 vehicle_type = self.VEHICLE_CLASSES.get(int(class_id), "unknown")
-                color = (0, 255, 0)
+                info = self.object_info.get(int(track_id), {})
+                # Color: green=counted, yellow=tracking
+                color = (0, 255, 0) if info.get("counted") else (0, 255, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(
-                    frame,
-                    f"{vehicle_type} #{int(track_id)}",
-                    (x1, max(y1 - 10, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    1,
-                )
+                label = f"{vehicle_type} #{int(track_id)}"
+                if info.get("origin_zone"):
+                    label += f" [{info['origin_zone']}]"
+                cv2.putText(frame, label, (x1, max(y1 - 10, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-            # Draw counts on frame
-            cv2.putText(
-                frame,
-                f"Lane1 Up: {self.counts['lane1']['up']} Down: {self.counts['lane1']['down']}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"Lane2 Up: {self.counts['lane2']['up']} Down: {self.counts['lane2']['down']}",
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
+            # Draw count panel (black background at top-left)
+            panel_h = 160
+            panel_w = 400
+            cv2.rectangle(frame, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
+            y_text = 22
+            line_h = 22
+            cv2.putText(frame, f"3si Entry Total: {self.counts['total']}  "
+                        f"(Car:{self.counts['by_type']['car']} Bus:{self.counts['by_type']['bus']} "
+                        f"Truck:{self.counts['by_type']['truck']})",
+                        (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            y_text += line_h + 5
+            lt = self.counts["left_turn"]
+            cv2.putText(frame, f"Left Turn (11si): {lt['total']}  "
+                        f"(Car:{lt['car']} Bus:{lt['bus']} Truck:{lt['truck']})",
+                        (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            y_text += line_h
+            rt = self.counts["right_turn"]
+            cv2.putText(frame, f"Right Turn (7si): {rt['total']}  "
+                        f"(Car:{rt['car']} Bus:{rt['bus']} Truck:{rt['truck']})",
+                        (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
+            y_text += line_h
+            st = self.counts["straight"]
+            cv2.putText(frame, f"Straight/Other:   {st['total']}  "
+                        f"(Car:{st['car']} Bus:{st['bus']} Truck:{st['truck']})",
+                        (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+            y_text += line_h + 5
+            cv2.putText(frame, "Press Q to quit",
+                        (8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
 
-            # Display the frame in a window.  Press 'q' to quit.
-            # Resize for display to avoid overwhelming the screen
+            # Display resized frame
             display_h = 720
             scale = display_h / frame.shape[0]
             display_w = int(frame.shape[1] * scale)
             display_frame = cv2.resize(frame, (display_w, display_h))
             cv2.imshow("Vehicle Counter", display_frame)
 
-            # On first frame, position the result window
             if not hasattr(self, "_window_moved"):
                 if is_screen:
-                    # Place window at top-left so it's always visible
                     cv2.moveWindow("Vehicle Counter", 0, 0)
                 self._window_moved = True
 
@@ -467,29 +488,13 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Path to YOLO weights file (e.g. yolov8n.pt)",
     )
     parser.add_argument(
-        "--y-line-ratio", type=float, default=0.5,
-        help="Vertical position of counting line as fraction of frame height (0-1)",
+        "--zones", type=str, default="zones.json",
+        help="Path to zone configuration JSON (generated by zone_config.py)",
     )
-    parser.add_argument(
-        "--lane-divider-ratio", type=float, default=0.5,
-        help="Horizontal position of lane divider as fraction of frame width (0-1)",
-    )
-    parser.add_argument(
-        "--screen-top", type=int, default=None,
-        help="Screen capture region: top pixel coordinate",
-    )
-    parser.add_argument(
-        "--screen-left", type=int, default=None,
-        help="Screen capture region: left pixel coordinate",
-    )
-    parser.add_argument(
-        "--screen-width", type=int, default=None,
-        help="Screen capture region: width in pixels",
-    )
-    parser.add_argument(
-        "--screen-height", type=int, default=None,
-        help="Screen capture region: height in pixels",
-    )
+    parser.add_argument("--screen-top", type=int, default=None)
+    parser.add_argument("--screen-left", type=int, default=None)
+    parser.add_argument("--screen-width", type=int, default=None)
+    parser.add_argument("--screen-height", type=int, default=None)
     parser.add_argument(
         "--db-url", type=str, default=None,
         help="SQLAlchemy database URL (optional)",
@@ -505,7 +510,6 @@ def main() -> None:
     """Entry point for command line execution."""
     args = parse_args()
 
-    # Build screen region dict if any screen coordinate is specified
     screen_region = None
     if args.source == "screen" and all(
         v is not None for v in [args.screen_top, args.screen_left, args.screen_width, args.screen_height]
@@ -520,8 +524,7 @@ def main() -> None:
     counter = VehicleCounter(
         source=args.source,
         weights=args.weights,
-        y_line_ratio=args.y_line_ratio,
-        lane_divider_ratio=args.lane_divider_ratio,
+        zones_path=args.zones,
         db_url=args.db_url,
         api_url=args.api_url,
         screen_region=screen_region,
