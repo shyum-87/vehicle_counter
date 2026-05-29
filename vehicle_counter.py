@@ -89,7 +89,7 @@ requests: Any = None
 mss: Any = None
 create_engine: Any = None
 SQLAlchemyError: Any = Exception
-APP_VERSION = "2026-05-29-dependency-diagnostics"
+APP_VERSION = "2026-05-29-check-deps-source-fix"
 
 
 class DependencyError(RuntimeError):
@@ -892,7 +892,8 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Endpoint URL to send count events as JSON (optional)",
     )
     parsed = parser.parse_args(args)
-    if not (parsed.check_env or parsed.check_deps) and not parsed.source:
+    diagnostic_mode = parsed.check_env or parsed.check_deps
+    if not diagnostic_mode and not parsed.source:
         parser.error("--source is required unless --check-env or --check-deps is used")
 
     screen_values = [

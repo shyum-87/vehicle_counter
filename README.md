@@ -94,12 +94,14 @@ PyTorch/Ultralytics/OpenCV 등 실행 의존성이 정상 import되는지 확인
 python vehicle_counter.py --check-deps
 ```
 
-만약 `unrecognized arguments: --check-deps`가 나오면 현재 실행 중인 `vehicle_counter.py`가 이 옵션이 들어간 최신 파일이 아닙니다. 아래 명령으로 실행 중인 파일 경로와 버전을 먼저 확인하세요.
+만약 `unrecognized arguments: --check-deps`가 나오거나 `--check-deps` 실행 시 `--source is required`가 나오면 현재 실행 중인 `vehicle_counter.py`가 이 옵션이 완전히 반영된 최신 파일이 아닙니다. 아래 명령으로 실행 중인 파일 경로와 버전을 먼저 확인하세요.
 
 ```bash
 python vehicle_counter.py --check-env
 python vehicle_counter.py --version
 ```
+
+최신 파일이면 `--version`이 `vehicle_counter.py 2026-05-29-check-deps-source-fix`로 출력됩니다.
 
 카운터 실행 로그에도 `Runtime environment: version=..., script=..., os=..., is_windows=...`가 출력됩니다. Windows 환경이면 `is_windows=True`로 표시됩니다.
 
