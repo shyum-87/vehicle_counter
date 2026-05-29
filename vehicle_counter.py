@@ -193,6 +193,7 @@ def format_torch_dll_help(error: OSError) -> str:
             "install a torch/torchvision build matching that CUDA runtime.",
             "  3. Install or repair Microsoft Visual C++ Redistributable 2015-2022 "
             "(x64), then recreate the virtual environment if needed.",
+            "Next diagnostic command: python vehicle_counter.py --check-deps",
         ])
     return "\n".join(guidance)
 
@@ -367,7 +368,26 @@ class VehicleCounter:
             "timestamp", "direction", "vehicle_type",
             "car_count", "bus_count", "truck_count", "total_count",
         ])
+        self._closed = False
         self.logger.info("CSV log: %s", self.csv_path)
+
+    def _cleanup(self, capture=None, is_screen: bool = False) -> None:
+        """Close opened resources before the program exits."""
+        if capture is not None:
+            if is_screen:
+                sct, _ = capture
+                sct.close()
+            else:
+                capture.release()
+        if cv2 is not None:
+            cv2.destroyAllWindows()
+        if not self._closed:
+            self._csv_file.close()
+            self._closed = True
+            self.logger.info(
+                "CSV log saved: %s (%d records)",
+                self.csv_path, self.counts["total"],
+            )
 
     def save_to_db(self, timestamp: datetime.datetime, lane: str, direction: str, vehicle_type: str) -> None:
         """Persist a count event to the configured database.
@@ -608,12 +628,11 @@ class VehicleCounter:
             return
 
         if not self._load_model_and_tracker():
-            if is_screen:
-                sct, _ = capture
-                sct.close()
-            else:
-                capture.release()
-            cv2.destroyAllWindows()
+            self.logger.error(
+                "Model/tracker initialization failed. Run `python vehicle_counter.py --check-deps` "
+                "to identify the failing dependency before starting screen capture."
+            )
+            self._cleanup(capture, is_screen)
             return
 
         if is_screen:
@@ -827,15 +846,7 @@ class VehicleCounter:
                 break
 
         # Cleanup
-        self._csv_file.close()
-        self.logger.info("CSV log saved: %s (%d records)", self.csv_path, self.counts["total"])
-
-        if is_screen:
-            sct, _ = capture
-            sct.close()
-        else:
-            capture.release()
-        cv2.destroyAllWindows()
+        self._cleanup(capture, is_screen)
 
 
 def parse_args(args: Optional[list] = None) -> argparse.Namespace:
