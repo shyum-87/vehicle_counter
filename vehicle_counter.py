@@ -69,33 +69,188 @@ Then launch the script with the appropriate arguments.  Modify the
 database and API.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import datetime
 import json
+import importlib
 import logging
 import os
+import platform
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
-try:
-    from ultralytics import YOLO  # type: ignore
-    import supervision as sv  # type: ignore
-    import cv2  # type: ignore
-    import numpy as np  # type: ignore
-    import requests  # type: ignore
-    import mss  # type: ignore
-    from sqlalchemy import create_engine  # type: ignore
-    from sqlalchemy.exc import SQLAlchemyError  # type: ignore
-except ImportError as e:  # pragma: no cover
-    missing_pkg = str(e).split("'")[1]
-    print(
-        f"Missing required package: {missing_pkg}. Please install the "
-        "dependencies listed in the module documentation before running this script.",
-        file=sys.stderr,
+cv2: Any = None
+np: Any = None
+requests: Any = None
+mss: Any = None
+create_engine: Any = None
+SQLAlchemyError: Any = Exception
+APP_VERSION = "2026-05-29-dependency-diagnostics"
+
+
+class DependencyError(RuntimeError):
+    """Raised when a required runtime dependency cannot be loaded."""
+
+
+def _missing_dependency_message(error: ImportError) -> str:
+    """Format import errors, including native-library load failures."""
+    missing_pkg = str(error).split("'")[1] if "'" in str(error) else str(error)
+    return (
+        f"Missing required package or native library: {missing_pkg}. Please install "
+        "the dependencies listed in the module documentation before running this script."
     )
-    raise
+
+
+def load_core_dependencies(logger: Optional[logging.Logger] = None) -> bool:
+    """Load runtime dependencies that are not needed for --check-env."""
+    global cv2, np, requests, mss, create_engine, SQLAlchemyError
+    if all(value is not None for value in [cv2, np, requests, mss, create_engine]):
+        return True
+
+    try:
+        cv2_module = importlib.import_module("cv2")
+        np_module = importlib.import_module("numpy")
+        requests_module = importlib.import_module("requests")
+        mss_module = importlib.import_module("mss")
+        sqlalchemy_module = importlib.import_module("sqlalchemy")
+        sqlalchemy_exc_module = importlib.import_module("sqlalchemy.exc")
+    except ImportError as e:  # pragma: no cover
+        message = _missing_dependency_message(e)
+        if logger:
+            logger.error(message)
+        else:
+            print(message, file=sys.stderr)
+        return False
+
+    cv2 = cv2_module
+    np = np_module
+    requests = requests_module
+    mss = mss_module
+    create_engine = sqlalchemy_module.create_engine
+    SQLAlchemyError = sqlalchemy_exc_module.SQLAlchemyError
+    return True
+
+
+def get_runtime_environment() -> Dict[str, str]:
+    """Return a small runtime summary for troubleshooting user environments."""
+    return {
+        "app_version": APP_VERSION,
+        "script_path": os.path.abspath(__file__),
+        "os_name": platform.system() or "unknown",
+        "is_windows": str(os.name == "nt" or sys.platform.startswith("win")),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "python_architecture": platform.architecture()[0],
+        "python_executable": sys.executable,
+    }
+
+
+def format_runtime_environment() -> str:
+    """Format runtime environment details as a single log-friendly line."""
+    env = get_runtime_environment()
+    return (
+        f"version={env['app_version']}, script={env['script_path']}, "
+        f"os={env['os_name']}, is_windows={env['is_windows']}, "
+        f"platform={env['platform']}, python={env['python_version']} "
+        f"({env['python_architecture']}), executable={env['python_executable']}"
+    )
+
+
+def print_runtime_environment() -> None:
+    """Print runtime environment details without starting capture/model loading."""
+    env = get_runtime_environment()
+    print("Runtime environment")
+    print("===================")
+    print(f"App version: {env['app_version']}")
+    print(f"Script: {env['script_path']}")
+    print(f"OS name: {env['os_name']}")
+    print(f"Is Windows: {env['is_windows']}")
+    print(f"Platform: {env['platform']}")
+    print(f"Python: {env['python_version']} ({env['python_architecture']})")
+    print(f"Executable: {env['python_executable']}")
+
+
+def format_torch_dll_help(error: OSError) -> str:
+    """Return actionable guidance for common Windows PyTorch DLL failures."""
+    details = str(error)
+    guidance = [
+        "Failed to initialize PyTorch/Ultralytics native DLLs.",
+        f"Original error: {details}",
+        f"Detected runtime: {format_runtime_environment()}",
+    ]
+    if "WinError 1114" in details or "c10.dll" in details:
+        guidance.extend([
+            "This is a PyTorch native DLL initialization failure, not a screen "
+            "capture coordinate or ROI selection problem.",
+            "Recommended Windows checks:",
+            "  1. Reinstall torch/torchvision for your target compute platform "
+            "(CPU-only is the safest first test).",
+            "  2. If you intend to use NVIDIA GPU, update the NVIDIA driver and "
+            "install a torch/torchvision build matching that CUDA runtime.",
+            "  3. Install or repair Microsoft Visual C++ Redistributable 2015-2022 "
+            "(x64), then recreate the virtual environment if needed.",
+        ])
+    return "\n".join(guidance)
+
+
+def _module_version(module: Any) -> str:
+    """Return a module version string when available."""
+    return str(getattr(module, "__version__", "unknown"))
+
+
+def print_ml_dependency_check() -> bool:
+    """Import ML/runtime packages one by one and print a troubleshooting report."""
+    print_runtime_environment()
+    print()
+    print("Dependency check")
+    print("================")
+
+    ok = True
+    for module_name in ["cv2", "numpy", "mss", "sqlalchemy", "requests"]:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            ok = False
+            print(f"[FAIL] {module_name}: {_missing_dependency_message(exc)}")
+        else:
+            print(f"[ OK ] {module_name}: {_module_version(module)}")
+
+    torch = None
+    try:
+        torch = importlib.import_module("torch")
+    except ImportError as exc:
+        ok = False
+        print(f"[FAIL] torch: {_missing_dependency_message(exc)}")
+    except OSError as exc:
+        ok = False
+        print(f"[FAIL] torch:\n{format_torch_dll_help(exc)}")
+    else:
+        print(f"[ OK ] torch: {_module_version(torch)}")
+        print(f"       torch path: {getattr(torch, '__file__', 'unknown')}")
+        print(f"       torch CUDA build: {getattr(torch.version, 'cuda', None)}")
+        print(f"       CUDA available: {torch.cuda.is_available()}")
+
+    for module_name in ["torchvision", "ultralytics", "supervision"]:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            ok = False
+            print(f"[FAIL] {module_name}: {_missing_dependency_message(exc)}")
+        except OSError as exc:
+            ok = False
+            print(f"[FAIL] {module_name}:\n{format_torch_dll_help(exc)}")
+        else:
+            print(f"[ OK ] {module_name}: {_module_version(module)}")
+
+    if ok:
+        print("\nAll checked dependencies imported successfully.")
+    else:
+        print("\nOne or more dependencies failed to import. Fix these before running capture.")
+    return ok
 
 
 def load_zones(path: str) -> Dict:
@@ -145,6 +300,9 @@ class VehicleCounter:
             handlers=[logging.StreamHandler(sys.stdout)],
         )
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info("Runtime environment: %s", format_runtime_environment())
+        if not load_core_dependencies(self.logger):
+            raise DependencyError("Failed to load required runtime dependencies")
 
         # Load zone configuration
         if not os.path.isfile(zones_path):
@@ -166,17 +324,13 @@ class VehicleCounter:
             )
             raise FileNotFoundError(f"Weights file not found: {weights}")
 
-        # Load YOLO model
-        self.logger.info("Loading YOLO model from %s", weights)
-        self.model = YOLO(weights)
-
-        # Select device: GPU if available, otherwise CPU
-        import torch
-        self.device = 0 if torch.cuda.is_available() else "cpu"
-        self.logger.info("Using device: %s", self.device)
-
-        # Initialise tracker
-        self.tracker = sv.ByteTrack()
+        # YOLO, PyTorch and Supervision are loaded lazily after screen-region
+        # selection so users can choose a monitor region before any heavy model
+        # dependency is initialized.
+        self.model = None
+        self.device: Any = "cpu"
+        self.tracker = None
+        self.sv = None
 
         # Database engine (initialised lazily)
         self.db_engine = None
@@ -340,6 +494,44 @@ class VehicleCounter:
             lx += 55
 
     @staticmethod
+    def _torch_dll_help(error: OSError) -> str:
+        """Return actionable guidance for common Windows PyTorch DLL failures."""
+        return format_torch_dll_help(error)
+
+    def _load_model_and_tracker(self) -> bool:
+        """Load YOLO/PyTorch/Supervision after the capture source is ready."""
+        if self.model is not None and self.tracker is not None:
+            return True
+
+        try:
+            ultralytics = importlib.import_module("ultralytics")
+            sv = importlib.import_module("supervision")
+            torch = importlib.import_module("torch")
+        except ImportError as e:  # pragma: no cover
+            missing_pkg = str(e).split("'")[1] if "'" in str(e) else str(e)
+            self.logger.error(
+                "Missing required package: %s. Please install dependencies from requirements.txt.",
+                missing_pkg,
+            )
+            return False
+        except OSError as e:  # pragma: no cover
+            self.logger.error("%s", self._torch_dll_help(e))
+            return False
+
+        self.logger.info("Loading YOLO model from %s", self.weights)
+        try:
+            self.model = ultralytics.YOLO(self.weights)
+        except OSError as e:  # pragma: no cover
+            self.logger.error("%s", self._torch_dll_help(e))
+            return False
+
+        self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.logger.info("Using device: %s", self.device)
+        self.sv = sv
+        self.tracker = sv.ByteTrack()
+        return True
+
+    @staticmethod
     def _select_screen_region(sct) -> Optional[Dict[str, int]]:
         """Show full screen capture and let user drag-select a region."""
         full_monitor = sct.monitors[1]
@@ -374,7 +566,7 @@ class VehicleCounter:
     def _open_source(self):
         """Open video source or screen capture. Returns (capture, is_screen) tuple."""
         if self.source == "screen":
-            sct = mss.mss()
+            sct = mss.MSS()
             if self.screen_region:
                 monitor = self.screen_region
             else:
@@ -415,6 +607,15 @@ class VehicleCounter:
         if capture is None:
             return
 
+        if not self._load_model_and_tracker():
+            if is_screen:
+                sct, _ = capture
+                sct.close()
+            else:
+                capture.release()
+            cv2.destroyAllWindows()
+            return
+
         if is_screen:
             _, monitor = capture
             frame_width = monitor["width"]
@@ -451,7 +652,7 @@ class VehicleCounter:
             result = results[0]
 
             # Convert to Supervision Detections and filter vehicle classes
-            detections = sv.Detections.from_ultralytics(result)
+            detections = self.sv.Detections.from_ultralytics(result)
             mask = np.isin(detections.class_id, list(self.VEHICLE_CLASSES.keys()))
             detections = detections[mask]
 
@@ -641,12 +842,23 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Vehicle counting with YOLO and ByteTrack")
     parser.add_argument(
-        "--source", type=str, required=True,
+        "--version", action="version", version=f"vehicle_counter.py {APP_VERSION}"
+    )
+    parser.add_argument(
+        "--source", type=str, default=None,
         help="Video source: file path, RTSP URL, or 'screen' for screen capture",
     )
     parser.add_argument(
         "--weights", type=str, default="yolov8s.pt",
         help="Path to YOLO weights file (e.g. yolov8n.pt)",
+    )
+    parser.add_argument(
+        "--check-env", action="store_true",
+        help="Print OS/Python runtime details and exit without opening capture/model",
+    )
+    parser.add_argument(
+        "--check-deps", action="store_true",
+        help="Import runtime/ML dependencies one by one and print diagnostics",
     )
     parser.add_argument(
         "--zones", type=str, default="zones.json",
@@ -657,6 +869,10 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("--screen-width", type=int, default=None)
     parser.add_argument("--screen-height", type=int, default=None)
     parser.add_argument(
+        "--select-screen-region", action="store_true",
+        help="For --source screen, choose the capture area by mouse drag at startup",
+    )
+    parser.add_argument(
         "--db-url", type=str, default=None,
         help="SQLAlchemy database URL (optional)",
     )
@@ -664,16 +880,44 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         "--api-url", type=str, default=None,
         help="Endpoint URL to send count events as JSON (optional)",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if not (parsed.check_env or parsed.check_deps) and not parsed.source:
+        parser.error("--source is required unless --check-env or --check-deps is used")
+
+    screen_values = [
+        parsed.screen_top, parsed.screen_left, parsed.screen_width, parsed.screen_height
+    ]
+    if parsed.source == "screen" and any(v is not None for v in screen_values) and not all(
+        v is not None for v in screen_values
+    ):
+        parser.error(
+            "--screen-top, --screen-left, --screen-width and --screen-height "
+            "must be provided together. Omit all four or use --select-screen-region "
+            "to choose the area with the mouse."
+        )
+    return parsed
 
 
 def main() -> None:
     """Entry point for command line execution."""
     args = parse_args()
+    if args.check_env:
+        print_runtime_environment()
+        return
+    if args.check_deps:
+        ok = print_ml_dependency_check()
+        sys.exit(0 if ok else 1)
 
     screen_region = None
-    if args.source == "screen" and all(
-        v is not None for v in [args.screen_top, args.screen_left, args.screen_width, args.screen_height]
+    if (
+        args.source == "screen"
+        and not args.select_screen_region
+        and all(
+            v is not None
+            for v in [
+                args.screen_top, args.screen_left, args.screen_width, args.screen_height
+            ]
+        )
     ):
         screen_region = {
             "top": args.screen_top,
@@ -682,14 +926,19 @@ def main() -> None:
             "height": args.screen_height,
         }
 
-    counter = VehicleCounter(
-        source=args.source,
-        weights=args.weights,
-        zones_path=args.zones,
-        db_url=args.db_url,
-        api_url=args.api_url,
-        screen_region=screen_region,
-    )
+    try:
+        counter = VehicleCounter(
+            source=args.source,
+            weights=args.weights,
+            zones_path=args.zones,
+            db_url=args.db_url,
+            api_url=args.api_url,
+            screen_region=screen_region,
+        )
+    except DependencyError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
     counter.run()
 
 
