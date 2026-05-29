@@ -37,6 +37,8 @@ COLORS = {
     "drawing": (0, 255, 255),   # yellow
 }
 
+DEFAULT_DISPLAY_SCALE = 0.25
+
 
 class ZoneDrawer:
     """Interactive polygon zone drawing on an OpenCV window."""
@@ -170,6 +172,10 @@ def parse_args(args=None):
         "--output", type=str, default="zones.json",
         help="Output JSON file path (default: zones.json)",
     )
+    parser.add_argument(
+        "--display-scale", type=float, default=DEFAULT_DISPLAY_SCALE,
+        help="Scale factor for the displayed configuration image (default: 0.25)",
+    )
     return parser.parse_args(args)
 
 
@@ -218,14 +224,37 @@ def load_frame(args) -> Optional[np.ndarray]:
         return frame
 
 
+def resize_for_display(frame: np.ndarray, scale: float) -> np.ndarray:
+    """Resize the configuration frame for easier interactive drawing."""
+    if scale <= 0:
+        raise ValueError("--display-scale must be greater than 0")
+    if scale == 1.0:
+        return frame
+
+    width = max(1, int(frame.shape[1] * scale))
+    height = max(1, int(frame.shape[0] * scale))
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+
 def main():
     args = parse_args()
     frame = load_frame(args)
     if frame is None:
         sys.exit(1)
 
+    try:
+        display_frame = resize_for_display(frame, args.display_scale)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
     print(f"Loaded frame: {frame.shape[1]}x{frame.shape[0]}")
-    drawer = ZoneDrawer(frame, args.output)
+    if display_frame.shape[:2] != frame.shape[:2]:
+        print(
+            f"Display frame: {display_frame.shape[1]}x{display_frame.shape[0]} "
+            f"(scale: {args.display_scale:g})"
+        )
+    drawer = ZoneDrawer(display_frame, args.output)
     drawer.run()
 
 
